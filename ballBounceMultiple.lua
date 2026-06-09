@@ -1,6 +1,6 @@
 --[[
-Bounces objects around a screen. 
-v1.0
+Bounces objects on a particular scene around. 
+v1.1
 
 To Do List
 -- Automatic refresh when new scene items are added 
@@ -11,7 +11,6 @@ To Do List
 -- Add sliding scale options for more constants 
 -- Make the UI less awful 
 -- Add more options aside from all align to center
--- Make "start_on_scene_change" make sense in the current version (holdover from previous code)
 -- Make tutorial for how to use 
 -- Install code comments (Current code comments are leftovers from previous project)
 -- Add README to GitHub
@@ -25,10 +24,11 @@ local obs = obslua
 local bit = require('bit')
 
 local items = {}
-local enabled_sources = {}
 local next = next
 local bounceOnMove = true
 local scriptSettings = nil
+
+local physics_scene_name = ""
 
 --- Hotkeys
 local hotkey_id_toggleBounce = obs.OBS_INVALID_HOTKEY_ID
@@ -37,8 +37,6 @@ local hotkey_id_centerAlign = obs.OBS_INVALID_HOTKEY_ID
 local hotkey_id_bounceOnMove = obs.OBS_INVALID_HOTKEY_ID
 
 -- Shared config
---- if true bouncing will auto start and stop on scene change
-local start_on_scene_change = true
 --- true when the scene item is being moved
 local active = false
 --- width of the scene the scene item belongs to
@@ -61,7 +59,7 @@ local elasticity = 0.8
 --- store its original position and color_add, to be restored when we stop bouncing it
 local function find_scene_item()
    items = {}
-   local source = obs.obs_frontend_get_current_scene()
+   local scene, source = get_physics_scene()
    if not source then return end
 
    local video_info = obs.obs_video_info()
@@ -71,22 +69,25 @@ local function find_scene_item()
    scene_width  = video_info.base_width
    scene_height = video_info.base_height
 
-   local scene = obs.obs_scene_from_source(source)
-   for name in pairs(enabled_sources) do
-      local scene_itemi = obs.obs_scene_find_source(scene, name)
-      obs.obs_sceneitem_set_bounds_type(scene_itemi, obs.OBS_BOUNDS_NONE)
-      items[name] = {
-         scene_item = scene_itemi,
+   local scene_items = obs.obs_scene_enum_items(scene)
+   add_scene_item(scene_items)
+   obs.sceneitem_list_release(scene_items)
+   
+   obs.obs_source_release(source)
+end
+
+function add_scene_item(scene_items)
+   for _, scene_item in ipairs(scene_items) do
+      table.insert(items,{
+         scene_item = scene_item,
          velocity_x = 0,
          velocity_y = 0,
          previous_pos = nil,
-         original_pos = nil,
+         original_pos = get_scene_item_pos(scene_item),
          wait = 1,
          held = false
-      }
-      items[name]["original_pos"] = get_scene_item_pos(scene_itemi)
+      })
    end
-   obs.obs_source_release(source)
 end
 
 function script_description()
@@ -98,15 +99,33 @@ function script_properties()
    
    obs.obs_properties_add_int_slider(props, 'throw_speed_x', 'Max Throw Speed (X):', 1, 200, 1)
    obs.obs_properties_add_int_slider(props, 'throw_speed_y', 'Max Throw Speed (Y):', 1, 100, 1)
-   obs.obs_properties_add_bool(props, 'start_on_scene_change', 'Auto start/stop on scene change')
    obs.obs_properties_add_button(props, 'button', 'Toggle', toggle)
    obs.obs_properties_add_button(props, 'bounceOnMove', 'Objects Bounce After Moving Toggle', bounceOnMoveToggle)
    obs.obs_properties_add_button(props, 'buttonBounce', 'Bounce', manualBounce)
    obs.obs_properties_add_button(props, 'originSetter', 'Set All To Center', originSetter)
 
-   for _, source_name in ipairs(get_source_names()) do
-      obs.obs_properties_add_bool(props, source_name, source_name)
+   local physics_scene_prop = obs.obs_properties_add_list(
+      props,
+      "physics_scene",
+      "Physics Scene",
+      obs.OBS_COMBO_TYPE_LIST,
+      obs.OBS_COMBO_FORMAT_STRING
+   )
+   local scenes = obs.obs_frontend_get_scenes()
+
+   if scenes then
+      for _, scene in ipairs(scenes) do
+         local name = obs.obs_source_get_name(scene)
+         obs.obs_property_list_add_string(
+            physics_scene_prop,
+            name,
+            name
+         )
+      end
+
+      obs.source_list_release(scenes)
    end
+
    return props
 end
 
@@ -115,46 +134,36 @@ function script_defaults(settings)
    obs.obs_data_set_default_int(settings, 'throw_speed_y', throw_speed_y)
 end
 
+function get_physics_scene()
+   if physics_scene_name == "" then
+      return nil
+   end
+
+   local source =
+      obs.obs_get_source_by_name(physics_scene_name)
+
+   if not source then
+      return nil
+   end
+
+   local scene =
+      obs.obs_scene_from_source(source)
+
+   return scene, source
+end
+
 function script_update(settings)
-   enabled_sources={}
    scriptSettings = settings
-   for _, source_name in ipairs(get_source_names()) do
-      if obs.obs_data_get_bool(settings, tostring(source_name)) then
-         enabled_sources[source_name] = true
-      end
-   end
 
-   for name in pairs(items) do
-      if not enabled_sources[name] then 
-         obs.obs_sceneitem_set_pos(items[name]['scene_item'], items[name]['original_pos'])
-         items[name] = nil
-      end
-   end
+   physics_scene_name = obs.obs_data_get_string(settings, "physics_scene")
 
-   local source = obs.obs_frontend_get_current_scene()
-   local scene = obs.obs_scene_from_source(source)
-   for name in pairs(enabled_sources) do 
-      if not items[name] then
-         local scene_itemi = obs.obs_scene_find_source(scene, name)
-         if scene_itemi then
-            obs.obs_sceneitem_set_bounds_type(scene_itemi, obs.OBS_BOUNDS_NONE)
-            items[name] = {
-               scene_item = scene_itemi,
-               velocity_x = math.random(-throw_speed_x, throw_speed_x)*30,
-               velocity_y = -math.random(throw_speed_y)*30,
-               previous_pos = nil,
-               original_pos = get_scene_item_pos(scene_itemi), 
-               wait = 1,
-               held = false
-            }
-         end
-      end
-   end
+   local scene, source = get_physics_scene()
+   if not scene then return end
+
    obs.obs_source_release(source)
 
    throw_speed_x = obs.obs_data_get_int(settings, 'throw_speed_x')
    throw_speed_y = obs.obs_data_get_int(settings, 'throw_speed_y')
-   start_on_scene_change = obs.obs_data_get_bool(settings, 'start_on_scene_change')
 end
 
 function script_load(settings)
@@ -188,11 +197,6 @@ function script_unload()
 end
 
 function on_event(event)
-   if event == obs.OBS_FRONTEND_EVENT_SCENE_CHANGED then
-      if start_on_scene_change then
-         scene_changed()
-      end
-   end
    if event == obs.OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN then
       if active then
          stop()
@@ -269,27 +273,6 @@ function update_body(body, dt)
    throw_scene_item(body,dt)
 
    body.previous_pos = get_scene_item_pos(body.scene_item)
-end
-
---- get a list of source names, sorted alphabetically
-function get_source_names()
-   local sources = obs.obs_enum_sources()
-   local source_names = {}
-   if sources then
-      for _, source in ipairs(sources) do
-         -- exclude Desktop Audio and Mic/Aux by their capabilities
-         local capability_flags = obs.obs_source_get_output_flags(source)
-         if bit.band(capability_flags, obs.OBS_SOURCE_DO_NOT_SELF_MONITOR) == 0 and
-            capability_flags ~= bit.bor(obs.OBS_SOURCE_AUDIO, obs.OBS_SOURCE_DO_NOT_DUPLICATE) then
-            table.insert(source_names, obs.obs_source_get_name(source))
-         end
-      end
-   end
-   obs.source_list_release(sources)
-   table.sort(source_names, function(a, b)
-      return string.lower(a) < string.lower(b)
-   end)
-   return source_names
 end
 
 --- convenience wrapper for getting a scene item's crop in a single statement
@@ -416,18 +399,6 @@ function toggle(pressed)
    end
 end
 
---- on scene change, stops bouncing the scene item if it's currently bouncing. If the scene item is
---- present in the current scene, starts bouncing it.
-function scene_changed()
-   if active then
-      stop()
-   end
-   find_scene_item()
-   if next(items)~=nil then
-      start()
-   end
-end
-
 --- round a number to the nearest integer
 function round(n)
    return math.floor(n + 0.5)
@@ -435,7 +406,8 @@ end
 
 function originSetter(pressed)
    if not pressed then return end
-   find_scene_item()
+   if next(items)== nil then find_scene_item() end
+
    for _, body in pairs(items) do 
       obs.obs_sceneitem_set_bounds_type(body.scene_item, obs.OBS_BOUNDS_NONE)
       local _, width, height = get_scene_item_dimensions(body.scene_item)
